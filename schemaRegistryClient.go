@@ -2,6 +2,7 @@ package srclient
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,10 @@ import (
 	"sync"
 	"time"
 
+	proto "github.com/golang/protobuf/proto"
+
 	"github.com/linkedin/goavro/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 // ISchemaRegistryClient provides the
@@ -74,14 +78,16 @@ type credentials struct {
 }
 
 type schemaRequest struct {
-	Schema     string `json:"schema"`
+	SchemaType SchemaType `json:"schemaType"`
+	Schema     string     `json:"schema"`
 }
 
 type schemaResponse struct {
-	Subject string `json:"subject"`
-	Version int    `json:"version"`
-	Schema  string `json:"schema"`
-	ID      int    `json:"id"`
+	Subject    string     `json:"subject"`
+	Version    int        `json:"version"`
+	Schema     string     `json:"schema"`
+	SchemaType SchemaType `json:"schemaType"`
+	ID         int        `json:"id"`
 }
 
 const (
@@ -98,7 +104,7 @@ const (
 func CreateSchemaRegistryClient(schemaRegistryURL string) *SchemaRegistryClient {
 	return &SchemaRegistryClient{schemaRegistryURL: schemaRegistryURL,
 		httpClient:     &http.Client{Timeout: 5 * time.Second},
-		cachingEnabled: true, codecCreationEnabled: true,
+		cachingEnabled: true, codecCreationEnabled: false,
 		idSchemaCache:      make(map[int]*Schema),
 		subjectSchemaCache: make(map[string]*Schema)}
 }
@@ -126,6 +132,7 @@ func (client *SchemaRegistryClient) GetSchema(schemaID int) (*Schema, error) {
 		return nil, err
 	}
 	var codec *goavro.Codec
+
 	if client.codecCreationEnabled {
 		codec, err = goavro.NewCodec(schemaResp.Schema)
 		if err != nil {
@@ -158,6 +165,9 @@ func (client *SchemaRegistryClient) GetLatestSchema(subject string, isKey bool) 
 	cachingEnabled := client.cachingEnabled
 	client.CachingEnabled(false)
 	schema, err := client.getVersion(subject, "latest", isKey)
+
+	fmt.Println("GetLatestSchema Function -> ", err)
+
 	client.CachingEnabled(cachingEnabled)
 
 	return schema, err
@@ -204,20 +214,27 @@ func (client *SchemaRegistryClient) CreateSchema(subject string, schema string,
 	default:
 		return nil, fmt.Errorf("invalid schema type. valid values are Avro, Json, or Protobuf")
 	}
-	schemaReq := schemaRequest{Schema: schema}
+	schemaReq := schemaRequest{Schema: schema, SchemaType: schemaType}
+
 	schemaBytes, err := json.Marshal(schemaReq)
+
 	if err != nil {
+		log.Println("Error Marshaling -> ", err)
 		return nil, err
 	}
 	payload := bytes.NewBuffer(schemaBytes)
 	resp, err := client.httpRequest("POST", fmt.Sprintf(subjectVersions, concreteSubject), payload)
+
 	if err != nil {
+		log.Println("Error Marshaling -> ", err)
 		return nil, err
 	}
 
 	schemaResp := new(schemaResponse)
 	err = json.Unmarshal(resp, &schemaResp)
+
 	if err != nil {
+		log.Println("Error Marshaling -> ", err)
 		return nil, err
 	}
 	// Conceptually, the schema returned below will be the
@@ -227,8 +244,11 @@ func (client *SchemaRegistryClient) CreateSchema(subject string, schema string,
 	// this logic strongly relies on the idempotent guarantees
 	// from Schema Registry, as well as in the best practice
 	// that schemas don't change very often.
+
 	newSchema, err := client.GetLatestSchema(subject, isKey)
 	if err != nil {
+		log.Println("Error Marshaling client.GetLatestSchema-> ", err)
+
 		return nil, err
 	}
 
@@ -300,25 +320,37 @@ func (client *SchemaRegistryClient) getVersion(subject string,
 	if err != nil {
 		return nil, err
 	}
-
+	fmt.Println("RESP")
+	fmt.Println(string(resp))
 	schemaResp := new(schemaResponse)
+	fmt.Println("Schema Response")
+
 	err = json.Unmarshal(resp, &schemaResp)
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println("json.Unmarshal(resp, &schemaResp)")
+
 	var codec *goavro.Codec
 	if client.codecCreationEnabled {
+		fmt.Println("client.codecCreationEnabled ", schemaResp.Schema)
 		codec, err = goavro.NewCodec(schemaResp.Schema)
 		if err != nil {
+			fmt.Println("goavro.NewCodec(schemaResp.Schema)", err)
+
 			return nil, err
 		}
 	}
+	fmt.Println("Schema Response after unmarshal")
+
 	var schema = &Schema{
 		id:      schemaResp.ID,
 		schema:  schemaResp.Schema,
 		version: schemaResp.Version,
 		codec:   codec,
 	}
+
+	fmt.Println("Schema Response after unmarshal 2")
 
 	if client.cachingEnabled {
 
@@ -342,6 +374,7 @@ func (client *SchemaRegistryClient) httpRequest(method, uri string, payload io.R
 
 	url := fmt.Sprintf("%s%s", client.schemaRegistryURL, uri)
 	req, err := http.NewRequest(method, url, payload)
+
 	if err != nil {
 		return nil, err
 	}
@@ -408,4 +441,20 @@ func createError(resp *http.Response) error {
 		return fmt.Errorf("%s: %s", resp.Status, errorResp.Message)
 	}
 	return fmt.Errorf("%s", resp.Status)
+}
+
+//MarshalProtobuf encodes a proto buffer message with the schema ID
+// and prepares the message to be sent
+func (client *SchemaRegistryClient) MarshalProtobuf(event proto.Message, schemaID int) ([]byte, error) {
+
+	payload, err := proto.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+
+	b := []byte{0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(b[1:], uint32(schemaID))
+	b = append(b, payload...)
+
+	return b, nil
 }
